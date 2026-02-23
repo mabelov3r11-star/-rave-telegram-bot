@@ -273,7 +273,7 @@ bot.command("upload", async (ctx) => {
   for (const line of lines) await redis(["LPUSH", "pool", line]);
   await ctx.reply(`Загружено в пул: ${lines.length}`);
   await logToChannel(`[UPLOAD]\nadmin=${ctx.from?.username || "-"}\ncount=${lines.length}\ntime=${new Date().toISOString()}`);
-});
+
 
 bot.catch(async (err, ctx) => {
   console.error("Bot error", err);
