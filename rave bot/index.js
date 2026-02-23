@@ -36,7 +36,6 @@ async function redis(cmd) {
   }
   return data.result;
 }
-}
 function isAdmin(ctx) {
   const id = String(ctx.from?.id || "");
   return ADMIN_IDS.includes(id);
