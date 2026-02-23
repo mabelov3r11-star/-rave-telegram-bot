@@ -269,7 +269,6 @@ bot.command("upload", async (ctx) => {
   const lines = body.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
   if (!lines.length) {
     return ctx.reply("Пришли /upload и далее строки вида login:key (каждая с новой строки) или отправь .txt файлом.");
- 
 
   for (const line of lines) await redis(["LPUSH", "pool", line]);
   await ctx.reply(`Загружено в пул: ${lines.length}`);
