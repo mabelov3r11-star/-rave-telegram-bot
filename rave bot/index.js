@@ -267,7 +267,7 @@ bot.command("upload", async (ctx) => {
   const text = String(msg?.text || "");
   const body = text.replace(/^\/upload(@\w+)?\s*/i, "");
   const lines = body.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-  if (!lines.length) {
+  if (!lines.length) 
     return ctx.reply("Пришли /upload и далее строки вида login:key (каждая с новой строки) или отправь .txt файлом.");
 
   for (const line of lines) await redis(["LPUSH", "pool", line]);
@@ -285,3 +285,7 @@ console.log("Bot started");
 
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
+
+
+
+  
