@@ -144,7 +144,7 @@ ${link}`,
     `[ISSUED]\nuser=${ctx.from?.username || "-"} id=${ctx.from?.id || "-"}` +
       `\nlink=${link}` +
       `\nlogin=${login}` +
-      `\nexpires=${new Date(record.expires_at).toISOString()}` +
+    
       `\ntime=${new Date().toISOString()}`
   );
 }
@@ -232,6 +232,7 @@ bot.command("info", async (ctx) => {
       `\ncreated: ${new Date(rec.created_at).toISOString()}` 
     
   );
+});
 
 
 bot.command("list", async (ctx) => {
@@ -268,7 +269,7 @@ bot.command("upload", async (ctx) => {
   const lines = body.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
   if (!lines.length) {
     return ctx.reply("Пришли /upload и далее строки вида login:key (каждая с новой строки) или отправь .txt файлом.");
-  }
+  });
 
   for (const line of lines) await redis(["LPUSH", "pool", line]);
   await ctx.reply(`Загружено в пул: ${lines.length}`);
