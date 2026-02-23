@@ -18,7 +18,6 @@ const UP_URL = process.env.UPSTASH_REDIS_REST_URL;
 const UP_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 if (!UP_URL || !UP_TOKEN) throw new Error("Missing Upstash env vars");
 
-
 async function redis(cmd) {
   const base = String(UP_URL).replace(/\/(command|pipeline)\/?$/, "");
 
@@ -36,6 +35,7 @@ async function redis(cmd) {
     throw new Error(data.error || `Redis HTTP ${resp.status}`);
   }
   return data.result;
+}
 }
 function isAdmin(ctx) {
   const id = String(ctx.from?.id || "");
