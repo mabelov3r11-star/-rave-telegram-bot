@@ -232,7 +232,7 @@ bot.command("info", async (ctx) => {
       `\ncreated: ${new Date(rec.created_at).toISOString()}` +
       
   );
-});
+
 
 bot.command("list", async (ctx) => {
   if (!isAdmin(ctx)) return;
