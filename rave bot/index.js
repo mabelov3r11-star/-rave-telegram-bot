@@ -19,15 +19,18 @@ const UP_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 if (!UP_URL || !UP_TOKEN) throw new Error("Missing Upstash env vars");
 
 async function redis(cmd) {
-  const base = String(UP_URL).replace(/\/(command|pipeline)\/?$/, "");
+  const url = String(UP_URL).endsWith("/command")
+    ? String(UP_URL)
+    : `${String(UP_URL).replace(/\/+$/, "")}/command`;
 
-  const resp = await fetch(`${base}/command`, {
+  const resp = await fetch(url, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${UP_TOKEN}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ command: cmd }),
+    // ВАЖНО: отправляем массив, а не { command: ... }
+    body: JSON.stringify(cmd),
   });
 
   const data = await resp.json().catch(() => ({}));
