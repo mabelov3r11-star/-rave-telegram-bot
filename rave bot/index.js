@@ -26,8 +26,9 @@ async function redis(cmd) {
       "Authorization": `Bearer ${UP_TOKEN}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(cmd),
+    body: JSON.stringify({ command: cmd }),
   });
+
   const data = await resp.json();
   if (!resp.ok || data.error) throw new Error(data.error || `Redis HTTP ${resp.status}`);
   return data.result;
