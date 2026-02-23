@@ -229,8 +229,8 @@ bot.command("info", async (ctx) => {
       `\nstatus: ${status}` +
       `\nlogin: ${rec.login || "-"}` +
       `\nissued_to: ${rec.issued_to?.username || "-"} (${rec.issued_to?.id || "-"})` +
-      `\ncreated: ${new Date(rec.created_at).toISOString()}` +
-      
+      `\ncreated: ${new Date(rec.created_at).toISOString()}` 
+    
   );
 
 
