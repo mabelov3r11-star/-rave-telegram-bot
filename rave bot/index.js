@@ -233,7 +233,6 @@ bot.command("info", async (ctx) => {
       
   );
 
-
 bot.command("list", async (ctx) => {
   if (!isAdmin(ctx)) return;
   const tokens = await redis(["LRANGE", "issued", 0, 9]).catch(() => []);
