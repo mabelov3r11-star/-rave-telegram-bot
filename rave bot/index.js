@@ -20,20 +20,21 @@ if (!UP_URL || !UP_TOKEN) throw new Error("Missing Upstash env vars");
 
 
 async function redis(cmd) {
-  // cmd пример: ["RPOP","pool"] или ["LPUSH","pool","abc"]
-  const [command, ...args] = cmd;
+  const base = String(UP_URL).replace(/\/(command|pipeline)\/?$/, "");
 
-  const resp = await fetch(`${UP_URL}/${String(command).toLowerCase()}`, {
+  const resp = await fetch(`${base}/command`, {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${UP_TOKEN}`,
+      Authorization: `Bearer ${UP_TOKEN}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(args),
+    body: JSON.stringify({ command: cmd }),
   });
 
-  const data = await resp.json();
-  if (!resp.ok || data.error) throw new Error(data.error || `Redis HTTP ${resp.status}`);
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok || data.error) {
+    throw new Error(data.error || `Redis HTTP ${resp.status}`);
+  }
   return data.result;
 }
 function isAdmin(ctx) {
