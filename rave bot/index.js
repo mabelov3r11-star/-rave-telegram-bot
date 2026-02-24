@@ -40,7 +40,7 @@ function genToken(len = 10) {
     .slice(0, len);
 }
 
-async function logToChannel(text) {
+async function tgLog(text) {
   if (!TG_CHANNEL_ID) return;
   try {
     await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
@@ -55,13 +55,30 @@ async function logToChannel(text) {
   } catch (_) {}
 }
 
-function kbForToken(token, showAdminButton) {
-  if (!showAdminButton) return undefined;
-  return {
-    reply_markup: {
-      inline_keyboard: [[{ text: "🗑 Удалить ссылку (админ)", callback_data: `del|${token}` }]],
-    },
-  };
+async function dbLog({ type, message, actor_id, actor_username, token }) {
+  try {
+    await supabase.from("logs").insert({
+      type,
+      message,
+      actor_id: actor_id ? String(actor_id) : null,
+      actor_username: actor_username ? String(actor_username) : null,
+      token: token ? String(token) : null,
+    });
+  } catch (_) {}
+}
+
+async function logAll(payload) {
+  // payload: {type, message, actor_id, actor_username, token}
+  const text =
+    `[${payload.type}]` +
+    (payload.token ? `\ntoken=${payload.token}` : "") +
+    (payload.actor_username ? `\nuser=@${payload.actor_username}` : "") +
+    (payload.actor_id ? `\nid=${payload.actor_id}` : "") +
+    `\n${payload.message}` +
+    `\ntime=${new Date().toISOString()}`;
+
+  await tgLog(text);
+  await dbLog(payload);
 }
 
 function parseLoginKey(line) {
@@ -86,7 +103,7 @@ async function poolCount() {
   return count || 0;
 }
 
-async function popPoolItemWithRetry(userId, username, tries = 5) {
+async function popPoolItemWithRetry(userId, username, tries = 7) {
   for (let i = 0; i < tries; i++) {
     const { data: rows, error: selErr } = await supabase
       .from("pool_items")
@@ -100,7 +117,7 @@ async function popPoolItemWithRetry(userId, username, tries = 5) {
 
     const item = rows[0];
 
-    // атомарность через условие used=false
+    // атомарно: берём только если used=false
     const { data: upd, error: updErr } = await supabase
       .from("pool_items")
       .update({
@@ -116,14 +133,12 @@ async function popPoolItemWithRetry(userId, username, tries = 5) {
 
     if (updErr) throw updErr;
     if (upd && upd.length > 0) return upd[0];
-    // иначе кто-то успел взять — повторяем
   }
   return null;
 }
 
 async function insertPoolItems(lines) {
   const rows = lines.map((v) => ({ value: v }));
-  // батчим по 500
   const chunkSize = 500;
   let inserted = 0;
 
@@ -152,15 +167,10 @@ async function getTokenRecord(token) {
   return data?.[0] || null;
 }
 
-async function revokeToken(token, by) {
-  const patch = {
-    revoked: true,
-    revoked_at: new Date().toISOString(),
-  };
-
+async function revokeToken(token) {
   const { data, error } = await supabase
     .from("tokens")
-    .update(patch)
+    .update({ revoked: true, revoked_at: new Date().toISOString() })
     .eq("token", token)
     .select("*")
     .limit(1);
@@ -169,10 +179,29 @@ async function revokeToken(token, by) {
   return data?.[0] || null;
 }
 
-async function lastTokens(limit = 10) {
+async function lastTokens(limit = 10, onlyActive = false) {
+  let q = supabase
+    .from("tokens")
+    .select("token,login,issued_to_id,issued_to_username,created_at,revoked,revoked_at,access_count,last_access_at")
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (onlyActive) q = q.eq("revoked", false);
+
+  const { data, error } = await q;
+  if (error) throw error;
+  return data || [];
+}
+
+async function tokensByUser(queryText, limit = 20) {
+  // ищем по username или id
+  const q = String(queryText || "").trim().replace(/^@/, "");
+  if (!q) return [];
+
   const { data, error } = await supabase
     .from("tokens")
-    .select("token,login,issued_to_id,issued_to_username,created_at,revoked,revoked_at")
+    .select("token,login,issued_to_id,issued_to_username,created_at,revoked,access_count,last_access_at")
+    .or(`issued_to_username.ilike.%${q}%,issued_to_id.ilike.%${q}%`)
     .order("created_at", { ascending: false })
     .limit(limit);
 
@@ -183,24 +212,27 @@ async function lastTokens(limit = 10) {
 // ========= BOT =========
 const bot = new Telegraf(BOT_TOKEN);
 
-// Команды в меню "/": public
+// команды в меню "/"
 async function setupCommands() {
   // публичные
   await bot.telegram.setMyCommands(
     [
-      { command: "start", description: "Статус и сколько доступов в пуле" },
+      { command: "start", description: "Статус и сколько доступов осталось" },
       { command: "link", description: "Получить персональную ссылку" },
     ],
     { scope: { type: "default" } }
   );
 
-  // админские (видны только админу, в его личном чате с ботом)
+  // админские (видны только админам)
   const adminCmds = [
     { command: "stock", description: "Сколько доступов в пуле" },
     { command: "upload", description: "Загрузить доступы (текст или .txt)" },
-    { command: "list", description: "Последние токены + кто получил" },
+    { command: "active", description: "Последние активные токены" },
+    { command: "list", description: "Последние токены (включая revoked)" },
+    { command: "search", description: "Найти токены по юзеру: /search @name или id" },
     { command: "info", description: "Инфо по токену: /info <token>" },
     { command: "revoke", description: "Отключить токен: /revoke <token>" },
+    { command: "logs", description: "Последние логи: /logs или /logs <тип>" },
   ];
 
   for (const id of ADMIN_IDS) {
@@ -210,52 +242,9 @@ async function setupCommands() {
   }
 }
 
-async function issueLinkForUser(ctx) {
-  const userId = ctx.from?.id;
-  const username = ctx.from?.username || "-";
-
-  const item = await popPoolItemWithRetry(userId, username);
-  if (!item) {
-    await ctx.reply("Сейчас нет доступов. Подождите — админ пополнит список, и попробуйте /link позже.");
-    await logToChannel(
-      `[EMPTY]\nuser=@${username}\nid=${userId || "-"}\ntime=${new Date().toISOString()}`
-    );
-    return;
-  }
-
-  const { login, key } = parseLoginKey(item.value);
-  const token = genToken(10);
-  const link = `${SITE_BASE}/${token}`;
-
-  await insertTokenRecord({
-    token,
-    login,
-    key,
-    issued_to_id: String(userId || ""),
-    issued_to_username: String(username || ""),
-    revoked: false,
-  });
-
-  await ctx.reply(`Ваша ссылка:\n\n${link}`);
-
-  await logToChannel(
-    `[ISSUED]\ntoken=${token}\nlink=${link}\nlogin=${login}\nuser=@${username}\nid=${userId || "-"}\ntime=${new Date().toISOString()}`
-  );
-}
-
-async function handleDelete(ctx, token) {
-  if (!isAdmin(ctx)) {
-    return ctx.answerCbQuery("Нет доступа.", { show_alert: true });
-  }
-
-  const rec = await revokeToken(token, ctx.from?.id).catch(() => null);
-  if (!rec) return ctx.answerCbQuery("Токен не найден.", { show_alert: true });
-
-  await logToChannel(
-    `[DELETE]\nadmin=@${ctx.from?.username || "-"}\nid=${ctx.from?.id || "-"}\ntoken=${token}\nlink=${SITE_BASE}/${token}\ntime=${new Date().toISOString()}`
-  );
-
-  return ctx.answerCbQuery("Ссылка отключена.", { show_alert: true });
+// публичная ссылка — ведёт на Netlify function роут /t/<token>
+function tokenLink(token) {
+  return `${SITE_BASE}/t/${token}`;
 }
 
 // ===== PUBLIC =====
@@ -263,34 +252,99 @@ bot.start(async (ctx) => {
   try {
     const n = await poolCount();
     await ctx.reply(
-      `Привет!\n\n` +
-      `Доступов в пуле: ${n}\n\n` +
-      `Чтобы получить ссылку — нажми /link`
+      `Готово.\n\nДоступов в пуле: ${n}\n\nЧтобы получить ссылку — нажми /link`
     );
   } catch (e) {
-    await logToChannel(`[ERROR]\nwhere=start\nerr=${String(e?.message || e)}\ntime=${new Date().toISOString()}`);
+    await logAll({
+      type: "ERROR",
+      message: `where=start\nerr=${String(e?.message || e)}`,
+      actor_id: ctx.from?.id,
+      actor_username: ctx.from?.username,
+    });
     await ctx.reply("Ошибка. Попробуйте позже.");
   }
 });
 
 bot.command("link", async (ctx) => {
   try {
-    await issueLinkForUser(ctx);
+    const userId = ctx.from?.id;
+    const username = ctx.from?.username || "-";
+
+    const item = await popPoolItemWithRetry(userId, username);
+    if (!item) {
+      await ctx.reply("Сейчас нет доступов. Подождите — админ пополнит пул.");
+      await logAll({
+        type: "EMPTY",
+        message: "pool empty",
+        actor_id: userId,
+        actor_username: username,
+      });
+      return;
+    }
+
+    const { login, key } = parseLoginKey(item.value);
+    const token = genToken(10);
+
+    await insertTokenRecord({
+      token,
+      login,
+      key,
+      issued_to_id: String(userId || ""),
+      issued_to_username: String(username || ""),
+      revoked: false,
+    });
+
+    const link = tokenLink(token);
+
+    await ctx.reply(`Ваша ссылка:\n\n${link}`);
+
+    await logAll({
+      type: "ISSUED",
+      message: `link=${link}\nlogin=${login}`,
+      actor_id: userId,
+      actor_username: username,
+      token,
+    });
   } catch (e) {
-    await logToChannel(`[ERROR]\nwhere=link\nerr=${String(e?.message || e)}\ntime=${new Date().toISOString()}`);
+    await logAll({
+      type: "ERROR",
+      message: `where=link\nerr=${String(e?.message || e)}`,
+      actor_id: ctx.from?.id,
+      actor_username: ctx.from?.username,
+    });
     await ctx.reply("Ошибка. Попробуйте позже.");
   }
 });
 
-// callback delete
+// callback delete — только админу
 bot.on("callback_query", async (ctx) => {
   try {
     const data = String(ctx.callbackQuery?.data || "");
     const [op, token] = data.split("|");
-    if (op === "del" && token) return await handleDelete(ctx, token);
-    return ctx.answerCbQuery();
-  } catch {
-    return ctx.answerCbQuery("Ошибка. Попробуйте ещё раз.", { show_alert: true });
+    if (op !== "del" || !token) return ctx.answerCbQuery();
+
+    if (!isAdmin(ctx)) return ctx.answerCbQuery("Нет доступа.", { show_alert: true });
+
+    const rec = await revokeToken(token);
+    if (!rec) return ctx.answerCbQuery("Токен не найден.", { show_alert: true });
+
+    await logAll({
+      type: "DELETE",
+      message: `revoked via button\nlink=${tokenLink(token)}`,
+      actor_id: ctx.from?.id,
+      actor_username: ctx.from?.username,
+      token,
+    });
+
+    return ctx.answerCbQuery("Ссылка отключена.", { show_alert: true });
+  } catch (e) {
+    await logAll({
+      type: "ERROR",
+      message: `where=callback_query\nerr=${String(e?.message || e)}`,
+      actor_id: ctx.from?.id,
+      actor_username: ctx.from?.username,
+    });
+    return ctx.answerCbQuery("Ошибка.", { show_alert: true });
   }
 });
 
@@ -300,9 +354,79 @@ bot.command("stock", async (ctx) => {
   try {
     const n = await poolCount();
     await ctx.reply(`В пуле доступов: ${n}`);
-    await logToChannel(`[STOCK]\nadmin=@${ctx.from?.username || "-"}\nid=${ctx.from?.id || "-"}\ncount=${n}\ntime=${new Date().toISOString()}`);
+    await logAll({
+      type: "STOCK",
+      message: `count=${n}`,
+      actor_id: ctx.from?.id,
+      actor_username: ctx.from?.username,
+    });
   } catch (e) {
-    await logToChannel(`[ERROR]\nwhere=stock\nerr=${String(e?.message || e)}\ntime=${new Date().toISOString()}`);
+    await logAll({
+      type: "ERROR",
+      message: `where=stock\nerr=${String(e?.message || e)}`,
+      actor_id: ctx.from?.id,
+      actor_username: ctx.from?.username,
+    });
+    await ctx.reply("Ошибка. Попробуйте позже.");
+  }
+});
+
+bot.command("upload", async (ctx) => {
+  if (!isAdmin(ctx)) return;
+
+  try {
+    const msg = ctx.message;
+
+    // .txt
+    if (msg?.document) {
+      const fileId = msg.document.file_id;
+      const file = await ctx.telegram.getFile(fileId);
+      const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
+      const text = await (await fetch(fileUrl)).text();
+      const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+
+      if (!lines.length) return ctx.reply("Файл пустой.");
+
+      const inserted = await insertPoolItems(lines);
+      const n = await poolCount();
+
+      await ctx.reply(`Загружено: ${inserted}\nТеперь в пуле: ${n}`);
+
+      await logAll({
+        type: "UPLOAD",
+        message: `count=${inserted}\npool_now=${n}`,
+        actor_id: ctx.from?.id,
+        actor_username: ctx.from?.username,
+      });
+      return;
+    }
+
+    // текст
+    const text = String(msg?.text || "");
+    const body = text.replace(/^\/upload(@\w+)?\s*/i, "");
+    const lines = body.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+
+    if (!lines.length) {
+      return ctx.reply("Пришли /upload и далее строки login:key (каждая с новой строки) или отправь .txt файлом.");
+    }
+
+    const inserted = await insertPoolItems(lines);
+    const n = await poolCount();
+    await ctx.reply(`Загружено: ${inserted}\nТеперь в пуле: ${n}`);
+
+    await logAll({
+      type: "UPLOAD",
+      message: `count=${inserted}\npool_now=${n}`,
+      actor_id: ctx.from?.id,
+      actor_username: ctx.from?.username,
+    });
+  } catch (e) {
+    await logAll({
+      type: "ERROR",
+      message: `where=upload\nerr=${String(e?.message || e)}`,
+      actor_id: ctx.from?.id,
+      actor_username: ctx.from?.username,
+    });
     await ctx.reply("Ошибка. Попробуйте позже.");
   }
 });
@@ -313,15 +437,25 @@ bot.command("revoke", async (ctx) => {
   if (!token) return ctx.reply("Использование: /revoke <token>");
 
   try {
-    const rec = await revokeToken(token, ctx.from?.id);
+    const rec = await revokeToken(token);
     if (!rec) return ctx.reply("Токен не найден.");
 
-    await ctx.reply(`Ок. Ссылка отключена:\n${SITE_BASE}/${token}`);
-    await logToChannel(
-      `[REVOKE]\nadmin=@${ctx.from?.username || "-"}\nid=${ctx.from?.id || "-"}\ntoken=${token}\nlink=${SITE_BASE}/${token}\ntime=${new Date().toISOString()}`
-    );
+    await ctx.reply(`Ок. Ссылка отключена:\n${tokenLink(token)}`);
+
+    await logAll({
+      type: "REVOKE",
+      message: `link=${tokenLink(token)}`,
+      actor_id: ctx.from?.id,
+      actor_username: ctx.from?.username,
+      token,
+    });
   } catch (e) {
-    await logToChannel(`[ERROR]\nwhere=revoke\nerr=${String(e?.message || e)}\ntime=${new Date().toISOString()}`);
+    await logAll({
+      type: "ERROR",
+      message: `where=revoke\nerr=${String(e?.message || e)}`,
+      actor_id: ctx.from?.id,
+      actor_username: ctx.from?.username,
+    });
     await ctx.reply("Ошибка. Попробуйте позже.");
   }
 });
@@ -336,9 +470,16 @@ bot.command("info", async (ctx) => {
     if (!rec) return ctx.reply("Токен не найден.");
 
     const status = rec.revoked ? "REVOKED" : "ACTIVE";
-    const link = `${SITE_BASE}/${token}`;
     const user = rec.issued_to_username ? `@${rec.issued_to_username}` : "-";
     const uid = rec.issued_to_id || "-";
+    const link = tokenLink(token);
+
+    // кнопку удаления показываем ТОЛЬКО админу
+    const extra = {
+      reply_markup: {
+        inline_keyboard: [[{ text: "🗑 Отключить (админ)", callback_data: `del|${token}` }]],
+      },
+    };
 
     await ctx.reply(
       `token: ${token}` +
@@ -347,104 +488,175 @@ bot.command("info", async (ctx) => {
         `\nlogin: ${rec.login || "-"}` +
         `\nuser: ${user} (${uid})` +
         `\ncreated: ${new Date(rec.created_at).toISOString()}` +
+        `\naccess_count: ${rec.access_count || 0}` +
+        (rec.last_access_at ? `\nlast_access: ${new Date(rec.last_access_at).toISOString()}` : "") +
         (rec.revoked_at ? `\nrevoked_at: ${new Date(rec.revoked_at).toISOString()}` : "") +
-        `\n\nУдалить: кнопка 🗑 или /revoke ${token}`,
-      kbForToken(token, true)
+        `\n\nУдалить: 🗑 или /revoke ${token}`,
+      extra
     );
 
-    await logToChannel(
-      `[INFO]\nadmin=@${ctx.from?.username || "-"}\nid=${ctx.from?.id || "-"}\ntoken=${token}\nstatus=${status}\nuser=${user}\nuid=${uid}\nlink=${link}\ntime=${new Date().toISOString()}`
-    );
+    await logAll({
+      type: "INFO",
+      message: `status=${status}\nuser=${user} (${uid})\nlink=${link}`,
+      actor_id: ctx.from?.id,
+      actor_username: ctx.from?.username,
+      token,
+    });
   } catch (e) {
-    await logToChannel(`[ERROR]\nwhere=info\nerr=${String(e?.message || e)}\ntime=${new Date().toISOString()}`);
+    await logAll({
+      type: "ERROR",
+      message: `where=info\nerr=${String(e?.message || e)}`,
+      actor_id: ctx.from?.id,
+      actor_username: ctx.from?.username,
+    });
+    await ctx.reply("Ошибка. Попробуйте позже.");
+  }
+});
+
+bot.command("active", async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  try {
+    const items = await lastTokens(10, true);
+    if (!items.length) return ctx.reply("Активных токенов нет.");
+
+    const rows = items.map((r) => {
+      const user = r.issued_to_username ? `@${r.issued_to_username}` : "-";
+      const uid = r.issued_to_id || "-";
+      return `${r.token} — ${user} (${uid}) — access=${r.access_count || 0}\n${tokenLink(r.token)}`;
+    });
+
+    await ctx.reply("Активные токены:\n\n" + rows.join("\n\n"));
+
+    await logAll({
+      type: "ACTIVE",
+      message: `count=${items.length}`,
+      actor_id: ctx.from?.id,
+      actor_username: ctx.from?.username,
+    });
+  } catch (e) {
+    await logAll({
+      type: "ERROR",
+      message: `where=active\nerr=${String(e?.message || e)}`,
+      actor_id: ctx.from?.id,
+      actor_username: ctx.from?.username,
+    });
     await ctx.reply("Ошибка. Попробуйте позже.");
   }
 });
 
 bot.command("list", async (ctx) => {
   if (!isAdmin(ctx)) return;
-
   try {
-    const items = await lastTokens(10);
+    const items = await lastTokens(10, false);
     if (!items.length) return ctx.reply("Список пуст.");
 
     const rows = items.map((r) => {
-      const token = r.token;
-      const link = `${SITE_BASE}/${token}`;
       const user = r.issued_to_username ? `@${r.issued_to_username}` : "-";
       const uid = r.issued_to_id || "-";
       const status = r.revoked ? "REVOKED" : "ACTIVE";
-      return `${token} — ${user} (${uid}) — ${status}\n${link}`;
+      return `${r.token} — ${user} (${uid}) — ${status}\n${tokenLink(r.token)}`;
     });
 
     await ctx.reply(
-      `Последние токены:\n\n` +
-        rows.join("\n\n") +
-        `\n\nУдалить ссылку:\n` +
-        `• /revoke <token>\n` +
-        `• или /info <token> → 🗑`
+      `Последние токены:\n\n${rows.join("\n\n")}\n\nУдалить:\n• /revoke <token>\n• или /info <token> → 🗑`
     );
 
-    await logToChannel(
-      `[LIST]\nadmin=@${ctx.from?.username || "-"}\nid=${ctx.from?.id || "-"}\ncount=${items.length}\ntime=${new Date().toISOString()}`
-    );
+    await logAll({
+      type: "LIST",
+      message: `count=${items.length}`,
+      actor_id: ctx.from?.id,
+      actor_username: ctx.from?.username,
+    });
   } catch (e) {
-    await logToChannel(`[ERROR]\nwhere=list\nerr=${String(e?.message || e)}\ntime=${new Date().toISOString()}`);
+    await logAll({
+      type: "ERROR",
+      message: `where=list\nerr=${String(e?.message || e)}`,
+      actor_id: ctx.from?.id,
+      actor_username: ctx.from?.username,
+    });
     await ctx.reply("Ошибка. Попробуйте позже.");
   }
 });
 
-bot.command("upload", async (ctx) => {
+bot.command("search", async (ctx) => {
   if (!isAdmin(ctx)) return;
+  const q = String(ctx.message?.text || "").split(/\s+/).slice(1).join(" ").trim();
+  if (!q) return ctx.reply("Использование: /search @username или /search <id>");
 
   try {
-    const msg = ctx.message;
+    const items = await tokensByUser(q, 20);
+    if (!items.length) return ctx.reply("Ничего не найдено.");
 
-    // если документ .txt
-    if (msg?.document) {
-      const fileId = msg.document.file_id;
-      const file = await ctx.telegram.getFile(fileId);
-      const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
-      const text = await (await fetch(fileUrl)).text();
-      const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    const rows = items.map((r) => {
+      const user = r.issued_to_username ? `@${r.issued_to_username}` : "-";
+      const uid = r.issued_to_id || "-";
+      const status = r.revoked ? "REVOKED" : "ACTIVE";
+      return `${r.token} — ${user} (${uid}) — ${status} — access=${r.access_count || 0}\n${tokenLink(r.token)}`;
+    });
 
-      if (!lines.length) return ctx.reply("Файл пустой.");
+    await ctx.reply(`Найдено: ${items.length}\n\n${rows.join("\n\n")}`);
 
-      const inserted = await insertPoolItems(lines);
-      const n = await poolCount();
-
-      await ctx.reply(`Загружено: ${inserted}\nТеперь в пуле: ${n}`);
-      await logToChannel(
-        `[UPLOAD]\nadmin=@${ctx.from?.username || "-"}\nid=${ctx.from?.id || "-"}\ncount=${inserted}\npool_now=${n}\ntime=${new Date().toISOString()}`
-      );
-      return;
-    }
-
-    // иначе текст после /upload
-    const text = String(msg?.text || "");
-    const body = text.replace(/^\/upload(@\w+)?\s*/i, "");
-    const lines = body.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-
-    if (!lines.length) {
-      return ctx.reply("Пришли /upload и далее строки login:key (каждая с новой строки) или отправь .txt файлом.");
-    }
-
-    const inserted = await insertPoolItems(lines);
-    const n = await poolCount();
-
-    await ctx.reply(`Загружено: ${inserted}\nТеперь в пуле: ${n}`);
-    await logToChannel(
-      `[UPLOAD]\nadmin=@${ctx.from?.username || "-"}\nid=${ctx.from?.id || "-"}\ncount=${inserted}\npool_now=${n}\ntime=${new Date().toISOString()}`
-    );
+    await logAll({
+      type: "SEARCH",
+      message: `query=${q}\ncount=${items.length}`,
+      actor_id: ctx.from?.id,
+      actor_username: ctx.from?.username,
+    });
   } catch (e) {
-    await logToChannel(`[ERROR]\nwhere=upload\nerr=${String(e?.message || e)}\ntime=${new Date().toISOString()}`);
+    await logAll({
+      type: "ERROR",
+      message: `where=search\nerr=${String(e?.message || e)}`,
+      actor_id: ctx.from?.id,
+      actor_username: ctx.from?.username,
+    });
+    await ctx.reply("Ошибка. Попробуйте позже.");
+  }
+});
+
+bot.command("logs", async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const type = String(ctx.message?.text || "").split(/\s+/)[1] || ""; // optional filter
+
+  try {
+    let q = supabase
+      .from("logs")
+      .select("type,message,actor_id,actor_username,token,created_at")
+      .order("created_at", { ascending: false })
+      .limit(15);
+
+    if (type) q = q.eq("type", type.toUpperCase());
+
+    const { data, error } = await q;
+    if (error) throw error;
+
+    if (!data || data.length === 0) return ctx.reply("Логов нет.");
+
+    const rows = data.map((r) => {
+      const who = r.actor_username ? `@${r.actor_username}` : "-";
+      const tok = r.token ? ` token=${r.token}` : "";
+      return `${r.created_at} [${r.type}] ${who}${tok}\n${r.message}`;
+    });
+
+    await ctx.reply(rows.join("\n\n"));
+  } catch (e) {
+    await logAll({
+      type: "ERROR",
+      message: `where=logs\nerr=${String(e?.message || e)}`,
+      actor_id: ctx.from?.id,
+      actor_username: ctx.from?.username,
+    });
     await ctx.reply("Ошибка. Попробуйте позже.");
   }
 });
 
 bot.catch(async (err, ctx) => {
   console.error("Bot error", err);
-  await logToChannel(`[ERROR]\nwhere=bot.catch\nerr=${String(err?.message || err)}\ntime=${new Date().toISOString()}`);
+  await logAll({
+    type: "ERROR",
+    message: `where=bot.catch\nerr=${String(err?.message || err)}`,
+    actor_id: ctx?.from?.id,
+    actor_username: ctx?.from?.username,
+  });
   try { await ctx.reply("Ошибка. Попробуйте позже."); } catch (_) {}
 });
 
@@ -453,6 +665,5 @@ await setupCommands();
 await bot.launch();
 console.log("Bot started");
 
-// graceful shutdown
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
