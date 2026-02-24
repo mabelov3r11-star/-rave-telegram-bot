@@ -1,331 +1,458 @@
-import { Telegraf, Markup } from "telegraf";
-import { createClient } from "@supabase/supabase-js";
+import { Telegraf } from "telegraf";
 import crypto from "crypto";
+import { createClient } from "@supabase/supabase-js";
 
-/* ===== ENV ===== */
+// ========= ENV =========
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const SITE_BASE = (process.env.SITE_BASE || "").replace(/\/+$/, "");
-const ADMIN_IDS = (process.env.ADMIN_IDS || "")
+if (!BOT_TOKEN) throw new Error("Missing BOT_TOKEN");
+
+const SITE_BASE = String(process.env.SITE_BASE || "").replace(/\/+$/, "");
+if (!SITE_BASE) throw new Error("Missing SITE_BASE (e.g. https://rave.onl)");
+
+const ADMIN_IDS = String(process.env.ADMIN_IDS || "")
   .split(",")
-  .map((x) => x.trim())
+  .map((s) => s.trim())
   .filter(Boolean);
 
 const TG_CHANNEL_ID = process.env.TG_CHANNEL_ID || ""; // optional
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+}
 
-if (!BOT_TOKEN) throw new Error("Missing BOT_TOKEN");
-if (!SITE_BASE) throw new Error("Missing SITE_BASE");
-if (!SUPABASE_URL || !SUPABASE_KEY) throw new Error("Missing Supabase vars");
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  auth: { persistSession: false },
+});
 
-/* ===== CLIENTS ===== */
-const bot = new Telegraf(BOT_TOKEN);
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+// ========= HELPERS =========
+function isAdmin(ctx) {
+  const id = String(ctx.from?.id || "");
+  return ADMIN_IDS.includes(id);
+}
 
-/* ===== HELPERS ===== */
-const isAdmin = (ctx) => ADMIN_IDS.includes(String(ctx.from?.id || ""));
-
-const genToken = () => crypto.randomBytes(16).toString("hex").slice(0, 10);
+function genToken(len = 10) {
+  return crypto
+    .randomBytes(16)
+    .toString("base64url")
+    .replace(/[^a-zA-Z0-9]/g, "")
+    .slice(0, len);
+}
 
 async function logToChannel(text) {
   if (!TG_CHANNEL_ID) return;
   try {
-    await bot.telegram.sendMessage(TG_CHANNEL_ID, text, {
-      disable_web_page_preview: true,
+    await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: TG_CHANNEL_ID,
+        text,
+        disable_web_page_preview: true,
+      }),
     });
-  } catch (e) {
-    // молча, чтобы бот не падал если нет прав/канал недоступен
+  } catch (_) {}
+}
+
+function kbForToken(token, showAdminButton) {
+  if (!showAdminButton) return undefined;
+  return {
+    reply_markup: {
+      inline_keyboard: [[{ text: "🗑 Удалить ссылку (админ)", callback_data: `del|${token}` }]],
+    },
+  };
+}
+
+function parseLoginKey(line) {
+  const s = String(line || "");
+  const parts = s.split(":");
+  if (parts.length >= 2) {
+    const login = parts.shift();
+    const key = parts.join(":");
+    return { login, key };
   }
+  return { login: `user_${Date.now()}`, key: s };
 }
 
-function kbForToken(token) {
-  return Markup.inlineKeyboard([
-    [Markup.button.callback("🗑 Отключить ссылку (админ)", `revoke:${token}`)],
-    [Markup.button.callback("ℹ️ Инфо", `info:${token}`)],
-  ]);
-}
-
-/* ===== DB HELPERS ===== */
-async function getNextPoolItem() {
-  const { data, error } = await supabase
+// ========= SUPABASE QUERIES =========
+async function poolCount() {
+  const { count, error } = await supabase
     .from("pool_items")
+    .select("*", { count: "exact", head: true })
+    .eq("used", false);
+
+  if (error) throw error;
+  return count || 0;
+}
+
+async function popPoolItemWithRetry(userId, username, tries = 5) {
+  for (let i = 0; i < tries; i++) {
+    const { data: rows, error: selErr } = await supabase
+      .from("pool_items")
+      .select("id,value")
+      .eq("used", false)
+      .order("id", { ascending: true })
+      .limit(1);
+
+    if (selErr) throw selErr;
+    if (!rows || rows.length === 0) return null;
+
+    const item = rows[0];
+
+    // атомарность через условие used=false
+    const { data: upd, error: updErr } = await supabase
+      .from("pool_items")
+      .update({
+        used: true,
+        used_at: new Date().toISOString(),
+        used_by_id: String(userId || ""),
+        used_by_username: String(username || ""),
+      })
+      .eq("id", item.id)
+      .eq("used", false)
+      .select("id,value")
+      .limit(1);
+
+    if (updErr) throw updErr;
+    if (upd && upd.length > 0) return upd[0];
+    // иначе кто-то успел взять — повторяем
+  }
+  return null;
+}
+
+async function insertPoolItems(lines) {
+  const rows = lines.map((v) => ({ value: v }));
+  // батчим по 500
+  const chunkSize = 500;
+  let inserted = 0;
+
+  for (let i = 0; i < rows.length; i += chunkSize) {
+    const chunk = rows.slice(i, i + chunkSize);
+    const { error } = await supabase.from("pool_items").insert(chunk);
+    if (error) throw error;
+    inserted += chunk.length;
+  }
+  return inserted;
+}
+
+async function insertTokenRecord(rec) {
+  const { error } = await supabase.from("tokens").insert(rec);
+  if (error) throw error;
+}
+
+async function getTokenRecord(token) {
+  const { data, error } = await supabase
+    .from("tokens")
     .select("*")
-    .eq("used", false)
-    .order("id", { ascending: true })
+    .eq("token", token)
     .limit(1);
 
   if (error) throw error;
   return data?.[0] || null;
 }
 
-async function markPoolUsed(id) {
-  const { error } = await supabase.from("pool_items").update({ used: true }).eq("id", id);
-  if (error) throw error;
-}
+async function revokeToken(token, by) {
+  const patch = {
+    revoked: true,
+    revoked_at: new Date().toISOString(),
+  };
 
-async function insertToken(rec) {
-  const { error } = await supabase.from("tokens").insert(rec);
-  if (error) throw error;
-}
+  const { data, error } = await supabase
+    .from("tokens")
+    .update(patch)
+    .eq("token", token)
+    .select("*")
+    .limit(1);
 
-async function getToken(token) {
-  const { data, error } = await supabase.from("tokens").select("*").eq("token", token).limit(1);
   if (error) throw error;
   return data?.[0] || null;
 }
 
-async function revokeToken(token, byCtx) {
-  const { error } = await supabase
+async function lastTokens(limit = 10) {
+  const { data, error } = await supabase
     .from("tokens")
-    .update({ revoked: true, revoked_at: new Date().toISOString() })
-    .eq("token", token);
+    .select("token,login,issued_to_id,issued_to_username,created_at,revoked,revoked_at")
+    .order("created_at", { ascending: false })
+    .limit(limit);
 
   if (error) throw error;
-
-  await logToChannel(
-    `[REVOKE]\nadmin=${byCtx.from?.username || "-"} id=${byCtx.from?.id || "-"}\ntoken=${token}\ntime=${new Date().toISOString()}`
-  );
+  return data || [];
 }
 
-/* ===== CORE: ISSUE LINK ===== */
-async function issueLink(ctx) {
-  const item = await getNextPoolItem();
+// ========= BOT =========
+const bot = new Telegraf(BOT_TOKEN);
 
+// Команды в меню "/": public
+async function setupCommands() {
+  // публичные
+  await bot.telegram.setMyCommands(
+    [
+      { command: "start", description: "Статус и сколько доступов в пуле" },
+      { command: "link", description: "Получить персональную ссылку" },
+    ],
+    { scope: { type: "default" } }
+  );
+
+  // админские (видны только админу, в его личном чате с ботом)
+  const adminCmds = [
+    { command: "stock", description: "Сколько доступов в пуле" },
+    { command: "upload", description: "Загрузить доступы (текст или .txt)" },
+    { command: "list", description: "Последние токены + кто получил" },
+    { command: "info", description: "Инфо по токену: /info <token>" },
+    { command: "revoke", description: "Отключить токен: /revoke <token>" },
+  ];
+
+  for (const id of ADMIN_IDS) {
+    const chat_id = Number(id);
+    if (!Number.isFinite(chat_id)) continue;
+    await bot.telegram.setMyCommands(adminCmds, { scope: { type: "chat", chat_id } });
+  }
+}
+
+async function issueLinkForUser(ctx) {
+  const userId = ctx.from?.id;
+  const username = ctx.from?.username || "-";
+
+  const item = await popPoolItemWithRetry(userId, username);
   if (!item) {
-    await ctx.reply("Нет доступов. Подождите — админ пополнит список и попробуйте снова.");
+    await ctx.reply("Сейчас нет доступов. Подождите — админ пополнит список, и попробуйте /link позже.");
     await logToChannel(
-      `[EMPTY]\nuser=${ctx.from?.username || "-"} id=${ctx.from?.id || "-"}\ntime=${new Date().toISOString()}`
+      `[EMPTY]\nuser=@${username}\nid=${userId || "-"}\ntime=${new Date().toISOString()}`
     );
     return;
   }
 
-  // помечаем used сразу, чтобы не было дублей при параллельных запросах
-  await markPoolUsed(item.id);
-
-  // формат login:key (ключ может содержать ":" — тогда join обратно)
-  const raw = String(item.value || "");
-  const parts = raw.split(":");
-  const login = parts.length >= 2 ? parts.shift() : `user_${Date.now()}`;
-  const key = parts.length >= 1 ? parts.join(":") : raw;
-
-  const token = genToken();
+  const { login, key } = parseLoginKey(item.value);
+  const token = genToken(10);
   const link = `${SITE_BASE}/${token}`;
 
-  await insertToken({
+  await insertTokenRecord({
     token,
     login,
     key,
-    issued_to_id: String(ctx.from?.id || ""),
-    issued_to_username: String(ctx.from?.username || ""),
-    created_at: new Date().toISOString(),
+    issued_to_id: String(userId || ""),
+    issued_to_username: String(username || ""),
     revoked: false,
   });
 
-  await ctx.reply(`Ваша ссылка:\n\n${link}`, kbForToken(token));
+  await ctx.reply(`Ваша ссылка:\n\n${link}`);
 
   await logToChannel(
-    `[ISSUED]\nuser=${ctx.from?.username || "-"} id=${ctx.from?.id || "-"}\nlogin=${login}\nlink=${link}\ntime=${new Date().toISOString()}`
+    `[ISSUED]\ntoken=${token}\nlink=${link}\nlogin=${login}\nuser=@${username}\nid=${userId || "-"}\ntime=${new Date().toISOString()}`
   );
 }
 
-/* ===== COMMANDS (USER) ===== */
-bot.start(issueLink);
-bot.command("link", issueLink);
-
-bot.command("help", async (ctx) => {
-  const text =
-    `Команды:\n` +
-    `/start — получить ссылку\n` +
-    `/link — получить ссылку\n` +
-    `/help — помощь\n\n` +
-    `Админу:\n` +
-    `/upload — загрузить доступы (login:key построчно)\n` +
-    `/stock — сколько доступов осталось\n` +
-    `/list — последние токены\n` +
-    `/info <token> — инфо по токену\n` +
-    `/revoke <token> — отключить токен`;
-  await ctx.reply(text);
-});
-
-/* ===== ADMIN: STOCK ===== */
-bot.command("stock", async (ctx) => {
-  if (!isAdmin(ctx)) return;
-
-  const { count, error } = await supabase
-    .from("pool_items")
-    .select("*", { count: "exact", head: true })
-    .eq("used", false);
-
-  if (error) return ctx.reply("Ошибка чтения базы.");
-  await ctx.reply(`В пуле осталось: ${count ?? 0}`);
-});
-
-/* ===== ADMIN: LIST LAST TOKENS ===== */
-bot.command("list", async (ctx) => {
-  if (!isAdmin(ctx)) return;
-
-  const { data, error } = await supabase
-    .from("tokens")
-    .select("token, created_at, revoked, issued_to_username")
-    .order("created_at", { ascending: false })
-    .limit(10);
-
-  if (error) return ctx.reply("Ошибка чтения базы.");
-
-  if (!data?.length) return ctx.reply("Список пуст.");
-
-  const lines = data.map((t) => {
-    const st = t.revoked ? "REVOKED" : "ACTIVE";
-    const u = t.issued_to_username || "-";
-    return `- ${t.token} (${st}) user=${u}`;
-  });
-
-  await ctx.reply("Последние токены:\n" + lines.join("\n"));
-});
-
-/* ===== ADMIN: INFO TOKEN ===== */
-bot.command("info", async (ctx) => {
-  if (!isAdmin(ctx)) return;
-
-  const token = String(ctx.message?.text || "").split(/\s+/)[1] || "";
-  if (!token) return ctx.reply("Использование: /info <token>");
-
-  const rec = await getToken(token);
-  if (!rec) return ctx.reply("Токен не найден.");
-
-  const status = rec.revoked ? "REVOKED" : "ACTIVE";
-  await ctx.reply(
-    `token: ${rec.token}\nstatus: ${status}\nlogin: ${rec.login || "-"}\nissued_to: ${rec.issued_to_username || "-"} (${rec.issued_to_id || "-"})\ncreated: ${rec.created_at}`
-  );
-});
-
-/* ===== ADMIN: REVOKE TOKEN ===== */
-bot.command("revoke", async (ctx) => {
-  if (!isAdmin(ctx)) return;
-
-  const token = String(ctx.message?.text || "").split(/\s+/)[1] || "";
-  if (!token) return ctx.reply("Использование: /revoke <token>");
-
-  const rec = await getToken(token);
-  if (!rec) return ctx.reply("Токен не найден.");
-
-  await revokeToken(token, ctx);
-  await ctx.reply(`Ок. Токен отключён: ${token}`);
-});
-
-/* ===== ADMIN: UPLOAD TEXT ===== */
-bot.command("upload", async (ctx) => {
-  if (!isAdmin(ctx)) return;
-
-  const body = String(ctx.message?.text || "").replace(/^\/upload(@\w+)?\s*/i, "");
-  const lines = body.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-
-  if (!lines.length) {
-    return ctx.reply(
-      "Формат:\n/upload\nlogin:key\nlogin:key\n\nили отправь .txt файлом (в подписи напиши /upload)"
-    );
+async function handleDelete(ctx, token) {
+  if (!isAdmin(ctx)) {
+    return ctx.answerCbQuery("Нет доступа.", { show_alert: true });
   }
 
-  const rows = lines.map((v) => ({ value: v, used: false }));
-  const { error } = await supabase.from("pool_items").insert(rows);
-  if (error) return ctx.reply("Ошибка записи в базу.");
+  const rec = await revokeToken(token, ctx.from?.id).catch(() => null);
+  if (!rec) return ctx.answerCbQuery("Токен не найден.", { show_alert: true });
 
-  await ctx.reply(`Загружено: ${lines.length}`);
   await logToChannel(
-    `[UPLOAD]\nadmin=${ctx.from?.username || "-"} id=${ctx.from?.id || "-"}\ncount=${lines.length}\ntime=${new Date().toISOString()}`
+    `[DELETE]\nadmin=@${ctx.from?.username || "-"}\nid=${ctx.from?.id || "-"}\ntoken=${token}\nlink=${SITE_BASE}/${token}\ntime=${new Date().toISOString()}`
   );
-});
 
-/* ===== ADMIN: UPLOAD .TXT DOCUMENT (caption must contain /upload) ===== */
-bot.on("document", async (ctx) => {
-  if (!isAdmin(ctx)) return;
+  return ctx.answerCbQuery("Ссылка отключена.", { show_alert: true });
+}
 
-  const caption = String(ctx.message?.caption || "");
-  if (!caption.includes("/upload")) return;
-
-  // Скачивание файла через Telegram API проще сделать через ctx.telegram.getFileLink
+// ===== PUBLIC =====
+bot.start(async (ctx) => {
   try {
-    const fileId = ctx.message.document.file_id;
-    const link = await ctx.telegram.getFileLink(fileId);
-    const text = await (await fetch(link.href)).text();
-
-    const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-    if (!lines.length) return ctx.reply("Файл пустой.");
-
-    const rows = lines.map((v) => ({ value: v, used: false }));
-    const { error } = await supabase.from("pool_items").insert(rows);
-    if (error) return ctx.reply("Ошибка записи в базу.");
-
-    await ctx.reply(`Загружено из файла: ${lines.length}`);
-    await logToChannel(
-      `[UPLOAD_FILE]\nadmin=${ctx.from?.username || "-"} id=${ctx.from?.id || "-"}\ncount=${lines.length}\ntime=${new Date().toISOString()}`
+    const n = await poolCount();
+    await ctx.reply(
+      `Привет!\n\n` +
+      `Доступов в пуле: ${n}\n\n` +
+      `Чтобы получить ссылку — нажми /link`
     );
   } catch (e) {
-    await ctx.reply("Не смог прочитать файл. Попробуй ещё раз.");
+    await logToChannel(`[ERROR]\nwhere=start\nerr=${String(e?.message || e)}\ntime=${new Date().toISOString()}`);
+    await ctx.reply("Ошибка. Попробуйте позже.");
   }
 });
 
-/* ===== CALLBACKS (inline buttons) ===== */
+bot.command("link", async (ctx) => {
+  try {
+    await issueLinkForUser(ctx);
+  } catch (e) {
+    await logToChannel(`[ERROR]\nwhere=link\nerr=${String(e?.message || e)}\ntime=${new Date().toISOString()}`);
+    await ctx.reply("Ошибка. Попробуйте позже.");
+  }
+});
+
+// callback delete
 bot.on("callback_query", async (ctx) => {
   try {
     const data = String(ctx.callbackQuery?.data || "");
-
-    if (data.startsWith("revoke:")) {
-      if (!isAdmin(ctx)) return ctx.answerCbQuery("Нет доступа.", { show_alert: true });
-
-      const token = data.replace("revoke:", "").trim();
-      const rec = await getToken(token);
-      if (!rec) return ctx.answerCbQuery("Токен не найден.", { show_alert: true });
-
-      await revokeToken(token, ctx);
-      return ctx.answerCbQuery("Отключено.", { show_alert: true });
-    }
-
-    if (data.startsWith("info:")) {
-      if (!isAdmin(ctx)) return ctx.answerCbQuery("Нет доступа.", { show_alert: true });
-
-      const token = data.replace("info:", "").trim();
-      const rec = await getToken(token);
-      if (!rec) return ctx.answerCbQuery("Токен не найден.", { show_alert: true });
-
-      const status = rec.revoked ? "REVOKED" : "ACTIVE";
-      await ctx.reply(
-        `token: ${rec.token}\nstatus: ${status}\nlogin: ${rec.login || "-"}\nissued_to: ${rec.issued_to_username || "-"} (${rec.issued_to_id || "-"})\ncreated: ${rec.created_at}`
-      );
-      return ctx.answerCbQuery();
-    }
-
+    const [op, token] = data.split("|");
+    if (op === "del" && token) return await handleDelete(ctx, token);
     return ctx.answerCbQuery();
-  } catch (e) {
-    return ctx.answerCbQuery("Ошибка.", { show_alert: true });
+  } catch {
+    return ctx.answerCbQuery("Ошибка. Попробуйте ещё раз.", { show_alert: true });
   }
 });
 
-/* ===== ERRORS ===== */
-bot.catch(async (err, ctx) => {
-  console.error("Bot error", err);
+// ===== ADMIN =====
+bot.command("stock", async (ctx) => {
+  if (!isAdmin(ctx)) return;
   try {
+    const n = await poolCount();
+    await ctx.reply(`В пуле доступов: ${n}`);
+    await logToChannel(`[STOCK]\nadmin=@${ctx.from?.username || "-"}\nid=${ctx.from?.id || "-"}\ncount=${n}\ntime=${new Date().toISOString()}`);
+  } catch (e) {
+    await logToChannel(`[ERROR]\nwhere=stock\nerr=${String(e?.message || e)}\ntime=${new Date().toISOString()}`);
     await ctx.reply("Ошибка. Попробуйте позже.");
-  } catch (_) {}
+  }
 });
 
-/* ===== SHOW COMMANDS IN TELEGRAM UI ===== */
-async function setupCommands() {
-  await bot.telegram.setMyCommands([
-    { command: "start", description: "Получить ссылку" },
-    { command: "link", description: "Получить ссылку" },
-    { command: "help", description: "Помощь / список команд" },
-    { command: "upload", description: "Админ: загрузить доступы (login:key)" },
-    { command: "stock", description: "Админ: сколько осталось доступов" },
-    { command: "list", description: "Админ: последние токены" },
-    { command: "info", description: "Админ: инфо по токену (/info <token>)" },
-    { command: "revoke", description: "Админ: отключить токен (/revoke <token>)" },
-  ]);
-}
+bot.command("revoke", async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const token = String(ctx.message?.text || "").split(/\s+/)[1] || "";
+  if (!token) return ctx.reply("Использование: /revoke <token>");
 
-(async () => {
-  await setupCommands();
-  await bot.launch();
-  console.log("Bot started");
-})();
+  try {
+    const rec = await revokeToken(token, ctx.from?.id);
+    if (!rec) return ctx.reply("Токен не найден.");
+
+    await ctx.reply(`Ок. Ссылка отключена:\n${SITE_BASE}/${token}`);
+    await logToChannel(
+      `[REVOKE]\nadmin=@${ctx.from?.username || "-"}\nid=${ctx.from?.id || "-"}\ntoken=${token}\nlink=${SITE_BASE}/${token}\ntime=${new Date().toISOString()}`
+    );
+  } catch (e) {
+    await logToChannel(`[ERROR]\nwhere=revoke\nerr=${String(e?.message || e)}\ntime=${new Date().toISOString()}`);
+    await ctx.reply("Ошибка. Попробуйте позже.");
+  }
+});
+
+bot.command("info", async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const token = String(ctx.message?.text || "").split(/\s+/)[1] || "";
+  if (!token) return ctx.reply("Использование: /info <token>");
+
+  try {
+    const rec = await getTokenRecord(token);
+    if (!rec) return ctx.reply("Токен не найден.");
+
+    const status = rec.revoked ? "REVOKED" : "ACTIVE";
+    const link = `${SITE_BASE}/${token}`;
+    const user = rec.issued_to_username ? `@${rec.issued_to_username}` : "-";
+    const uid = rec.issued_to_id || "-";
+
+    await ctx.reply(
+      `token: ${token}` +
+        `\nlink: ${link}` +
+        `\nstatus: ${status}` +
+        `\nlogin: ${rec.login || "-"}` +
+        `\nuser: ${user} (${uid})` +
+        `\ncreated: ${new Date(rec.created_at).toISOString()}` +
+        (rec.revoked_at ? `\nrevoked_at: ${new Date(rec.revoked_at).toISOString()}` : "") +
+        `\n\nУдалить: кнопка 🗑 или /revoke ${token}`,
+      kbForToken(token, true)
+    );
+
+    await logToChannel(
+      `[INFO]\nadmin=@${ctx.from?.username || "-"}\nid=${ctx.from?.id || "-"}\ntoken=${token}\nstatus=${status}\nuser=${user}\nuid=${uid}\nlink=${link}\ntime=${new Date().toISOString()}`
+    );
+  } catch (e) {
+    await logToChannel(`[ERROR]\nwhere=info\nerr=${String(e?.message || e)}\ntime=${new Date().toISOString()}`);
+    await ctx.reply("Ошибка. Попробуйте позже.");
+  }
+});
+
+bot.command("list", async (ctx) => {
+  if (!isAdmin(ctx)) return;
+
+  try {
+    const items = await lastTokens(10);
+    if (!items.length) return ctx.reply("Список пуст.");
+
+    const rows = items.map((r) => {
+      const token = r.token;
+      const link = `${SITE_BASE}/${token}`;
+      const user = r.issued_to_username ? `@${r.issued_to_username}` : "-";
+      const uid = r.issued_to_id || "-";
+      const status = r.revoked ? "REVOKED" : "ACTIVE";
+      return `${token} — ${user} (${uid}) — ${status}\n${link}`;
+    });
+
+    await ctx.reply(
+      `Последние токены:\n\n` +
+        rows.join("\n\n") +
+        `\n\nУдалить ссылку:\n` +
+        `• /revoke <token>\n` +
+        `• или /info <token> → 🗑`
+    );
+
+    await logToChannel(
+      `[LIST]\nadmin=@${ctx.from?.username || "-"}\nid=${ctx.from?.id || "-"}\ncount=${items.length}\ntime=${new Date().toISOString()}`
+    );
+  } catch (e) {
+    await logToChannel(`[ERROR]\nwhere=list\nerr=${String(e?.message || e)}\ntime=${new Date().toISOString()}`);
+    await ctx.reply("Ошибка. Попробуйте позже.");
+  }
+});
+
+bot.command("upload", async (ctx) => {
+  if (!isAdmin(ctx)) return;
+
+  try {
+    const msg = ctx.message;
+
+    // если документ .txt
+    if (msg?.document) {
+      const fileId = msg.document.file_id;
+      const file = await ctx.telegram.getFile(fileId);
+      const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
+      const text = await (await fetch(fileUrl)).text();
+      const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+
+      if (!lines.length) return ctx.reply("Файл пустой.");
+
+      const inserted = await insertPoolItems(lines);
+      const n = await poolCount();
+
+      await ctx.reply(`Загружено: ${inserted}\nТеперь в пуле: ${n}`);
+      await logToChannel(
+        `[UPLOAD]\nadmin=@${ctx.from?.username || "-"}\nid=${ctx.from?.id || "-"}\ncount=${inserted}\npool_now=${n}\ntime=${new Date().toISOString()}`
+      );
+      return;
+    }
+
+    // иначе текст после /upload
+    const text = String(msg?.text || "");
+    const body = text.replace(/^\/upload(@\w+)?\s*/i, "");
+    const lines = body.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+
+    if (!lines.length) {
+      return ctx.reply("Пришли /upload и далее строки login:key (каждая с новой строки) или отправь .txt файлом.");
+    }
+
+    const inserted = await insertPoolItems(lines);
+    const n = await poolCount();
+
+    await ctx.reply(`Загружено: ${inserted}\nТеперь в пуле: ${n}`);
+    await logToChannel(
+      `[UPLOAD]\nadmin=@${ctx.from?.username || "-"}\nid=${ctx.from?.id || "-"}\ncount=${inserted}\npool_now=${n}\ntime=${new Date().toISOString()}`
+    );
+  } catch (e) {
+    await logToChannel(`[ERROR]\nwhere=upload\nerr=${String(e?.message || e)}\ntime=${new Date().toISOString()}`);
+    await ctx.reply("Ошибка. Попробуйте позже.");
+  }
+});
+
+bot.catch(async (err, ctx) => {
+  console.error("Bot error", err);
+  await logToChannel(`[ERROR]\nwhere=bot.catch\nerr=${String(err?.message || err)}\ntime=${new Date().toISOString()}`);
+  try { await ctx.reply("Ошибка. Попробуйте позже."); } catch (_) {}
+});
+
+// запуск
+await setupCommands();
+await bot.launch();
+console.log("Bot started");
+
+// graceful shutdown
+process.once("SIGINT", () => bot.stop("SIGINT"));
+process.once("SIGTERM", () => bot.stop("SIGTERM"));
