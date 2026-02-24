@@ -1,8 +1,9 @@
 import { Telegraf } from "telegraf";
 import crypto from "crypto";
 
-// ============ ENV ============
-
+// =====================
+// ENV
+// =====================
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error("Missing BOT_TOKEN");
 
@@ -20,31 +21,22 @@ if (ADMIN_IDS.length === 0) {
 
 const TG_CHANNEL_ID = process.env.TG_CHANNEL_ID || ""; // optional
 
-const UP_URL_RAW = process.env.UPSTASH_REDIS_REST_URL;
+const UP_URL = String(process.env.UPSTASH_REDIS_REST_URL || "").replace(/\/+$/, "");
 const UP_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
-if (!UP_URL_RAW || !UP_TOKEN) throw new Error("Missing Upstash env vars");
 
-// Upstash URL can be:
-// - https://xxxx.upstash.io
-// - https://xxxx.upstash.io/command
-// - https://xxxx.upstash.io/pipeline
-// We normalize it to ".../command"
-function getUpstashCommandUrl() {
-  const u = String(UP_URL_RAW).trim().replace(/\/+$/, "");
-  if (u.endsWith("/command")) return u;
-  if (u.endsWith("/pipeline")) return u.replace(/\/pipeline$/, "/command");
-  return `${u}/command`;
-}
+if (!UP_URL || !UP_TOKEN) throw new Error("Missing Upstash env vars");
 
-// ============ HELPERS ============
-
+// =====================
+// Upstash Redis REST helper
+// IMPORTANT: body must be ARRAY, endpoint must be /command
+// =====================
 async function redis(cmdArray) {
-  // cmdArray must be like ["GET", "key"] / ["LPUSH", "list", "value"] etc.
   if (!Array.isArray(cmdArray) || cmdArray.length === 0) {
     throw new Error("redis(): cmdArray must be a non-empty array");
   }
 
-  const url = getUpstashCommandUrl();
+  // Accept both: https://xxx.upstash.io  OR https://xxx.upstash.io/command
+  const url = UP_URL.endsWith("/command") ? UP_URL : `${UP_URL}/command`;
 
   const resp = await fetch(url, {
     method: "POST",
@@ -52,27 +44,29 @@ async function redis(cmdArray) {
       Authorization: `Bearer ${UP_TOKEN}`,
       "Content-Type": "application/json",
     },
-    // IMPORTANT: Upstash expects JSON array, not {command: ...}
+    // MUST be an array like ["GET","key"]
     body: JSON.stringify(cmdArray),
   });
 
   const data = await resp.json().catch(() => ({}));
-
-  // Upstash usually returns { result: ... } or { error: ... }
-  if (!resp.ok || data.error) {
-    const msg =
-      data?.error ||
-      data?.message ||
-      `Upstash HTTP ${resp.status} ${resp.statusText}`;
-    throw new Error(msg);
-  }
-
+  if (!resp.ok || data.error) throw new Error(data.error || `Upstash HTTP ${resp.status}`);
   return data.result;
 }
 
+// =====================
+// Utils
+// =====================
 function isAdmin(ctx) {
   const id = String(ctx.from?.id || "");
   return ADMIN_IDS.includes(id);
+}
+
+function genToken(len = 10) {
+  return crypto
+    .randomBytes(16)
+    .toString("base64url")
+    .replace(/[^a-zA-Z0-9]/g, "")
+    .slice(0, len);
 }
 
 async function logToChannel(text) {
@@ -88,14 +82,6 @@ async function logToChannel(text) {
       }),
     });
   } catch (_) {}
-}
-
-function genToken(len = 10) {
-  return crypto
-    .randomBytes(16)
-    .toString("base64url")
-    .replace(/[^a-zA-Z0-9]/g, "")
-    .slice(0, len);
 }
 
 function kbForToken(token) {
@@ -122,25 +108,24 @@ async function saveTokenRecord(token, rec) {
 
 async function pushIssued(token) {
   await redis(["LPUSH", "issued", token]);
-  await redis(["LTRIM", "issued", "0", "49"]);
+  await redis(["LTRIM", "issued", 0, 49]);
 }
 
-// ============ CORE FLOW ============
-
+// =====================
+// Core logic
+// =====================
 async function issueLinkForUser(ctx) {
-  // Take one item from pool (login:key)
+  // Take one item from pool
   const item = await redis(["RPOP", "pool"]);
   if (!item) {
-    await ctx.reply(
-      "Сейчас нет доступов. Пожалуйста, подождите — админ пополнит список, и вы сможете запросить ссылку снова."
-    );
+    await ctx.reply("Сейчас нет доступов. Пожалуйста, подождите — админ пополнит список.");
     await logToChannel(
       `[EMPTY]\nuser=${ctx.from?.username || "-"} id=${ctx.from?.id || "-"}\ntime=${new Date().toISOString()}`
     );
     return;
   }
 
-  // Parse "login:key" (key can contain ':')
+  // Parse "login:key" (key can include ':')
   const s = String(item);
   const parts = s.split(":");
   let login = "";
@@ -155,7 +140,6 @@ async function issueLinkForUser(ctx) {
   }
 
   const token = genToken(10);
-
   const record = {
     login,
     key,
@@ -177,45 +161,46 @@ async function issueLinkForUser(ctx) {
 }
 
 async function handleDelete(ctx, token) {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery("Нет доступа.", { show_alert: true });
+
   const rec = await getTokenRecord(token);
   if (!rec) return ctx.answerCbQuery("Ссылка не найдена.", { show_alert: true });
-  if (!isAdmin(ctx)) return ctx.answerCbQuery("Нет доступа.", { show_alert: true });
 
   rec.revoked = true;
   rec.revoked_at = Date.now();
   await saveTokenRecord(token, rec);
 
   await logToChannel(
-    `[DELETE]\nby=${ctx.from?.username || "-"} id=${ctx.from?.id || "-"}\ntoken=${token}\ntime=${new Date().toISOString()}`
+    `[DELETE]\nadmin=${ctx.from?.username || "-"} id=${ctx.from?.id || "-"}\ntoken=${token}\ntime=${new Date().toISOString()}`
   );
 
   return ctx.answerCbQuery("Ссылка удалена (отключена).", { show_alert: true });
 }
 
-// ============ BOT ============
-
+// =====================
+// Bot setup
+// =====================
 const bot = new Telegraf(BOT_TOKEN);
 
+// User
 bot.start(async (ctx) => issueLinkForUser(ctx));
 bot.command("link", async (ctx) => issueLinkForUser(ctx));
 
-// inline button callback
+// Callback delete
 bot.on("callback_query", async (ctx) => {
   try {
     const data = String(ctx.callbackQuery?.data || "");
     const [op, token] = data.split("|");
-    if (!op || !token) return ctx.answerCbQuery();
-
-    if (op === "del") return await handleDelete(ctx, token);
-
+    if (op === "del" && token) return await handleDelete(ctx, token);
     return ctx.answerCbQuery();
-  } catch (_) {
+  } catch {
     return ctx.answerCbQuery("Ошибка. Попробуйте ещё раз.", { show_alert: true });
   }
 });
 
-// ===== Admin commands =====
-
+// =====================
+// Admin commands
+// =====================
 bot.command("stock", async (ctx) => {
   if (!isAdmin(ctx)) return;
   const n = await redis(["LLEN", "pool"]);
@@ -224,6 +209,7 @@ bot.command("stock", async (ctx) => {
 
 bot.command("revoke", async (ctx) => {
   if (!isAdmin(ctx)) return;
+
   const token = String(ctx.message?.text || "").split(/\s+/)[1] || "";
   if (!token) return ctx.reply("Использование: /revoke <token>");
 
@@ -242,6 +228,7 @@ bot.command("revoke", async (ctx) => {
 
 bot.command("info", async (ctx) => {
   if (!isAdmin(ctx)) return;
+
   const token = String(ctx.message?.text || "").split(/\s+/)[1] || "";
   if (!token) return ctx.reply("Использование: /info <token>");
 
@@ -261,8 +248,10 @@ bot.command("info", async (ctx) => {
 
 bot.command("list", async (ctx) => {
   if (!isAdmin(ctx)) return;
-  const tokens = await redis(["LRANGE", "issued", "0", "9"]).catch(() => []);
+
+  const tokens = await redis(["LRANGE", "issued", 0, 9]).catch(() => []);
   if (!tokens || tokens.length === 0) return ctx.reply("Список пуст.");
+
   await ctx.reply("Последние токены:\n" + tokens.map((t) => `- ${t}`).join("\n"));
 });
 
@@ -279,7 +268,6 @@ bot.command("upload", async (ctx) => {
     const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
     const text = await (await fetch(fileUrl)).text();
     const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-
     if (!lines.length) return ctx.reply("Файл пустой.");
 
     for (const line of lines) await redis(["LPUSH", "pool", line]);
@@ -310,7 +298,7 @@ bot.command("upload", async (ctx) => {
   );
 });
 
-// global error handler
+// Error handler (won't crash bot)
 bot.catch(async (err, ctx) => {
   console.error("Bot error", err);
   try {
@@ -318,8 +306,18 @@ bot.catch(async (err, ctx) => {
   } catch (_) {}
 });
 
-bot.launch();
-console.log("Bot started");
+// =====================
+// Start (fix 409 conflicts by removing webhook)
+// =====================
+async function start() {
+  // This prevents "409 Conflict" if webhook was set somewhere
+  await bot.telegram.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
+  await bot.launch({ dropPendingUpdates: true });
+
+  console.log("Bot started");
+}
+
+start();
 
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
