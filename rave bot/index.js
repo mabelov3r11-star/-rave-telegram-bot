@@ -1,13 +1,12 @@
 import { Telegraf } from "telegraf";
 import crypto from "crypto";
+import { createClient } from "@supabase/supabase-js";
 
-// =====================
-// ENV
-// =====================
+// ===== ENV =====
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error("Missing BOT_TOKEN");
 
-const SITE_BASE = String(process.env.SITE_BASE || "").replace(/\/+$/, "");
+const SITE_BASE = (process.env.SITE_BASE || "").replace(/\/+$/, "");
 if (!SITE_BASE) throw new Error("Missing SITE_BASE (e.g. https://rave.onl)");
 
 const ADMIN_IDS = String(process.env.ADMIN_IDS || "")
@@ -15,47 +14,19 @@ const ADMIN_IDS = String(process.env.ADMIN_IDS || "")
   .map((s) => s.trim())
   .filter(Boolean);
 
-if (ADMIN_IDS.length === 0) {
-  console.warn("WARN: ADMIN_IDS is empty. Admin commands will not work.");
-}
-
 const TG_CHANNEL_ID = process.env.TG_CHANNEL_ID || ""; // optional
 
-const UP_URL = String(process.env.UPSTASH_REDIS_REST_URL || "").replace(/\/+$/, "");
-const UP_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
-
-if (!UP_URL || !UP_TOKEN) throw new Error("Missing Upstash env vars");
-
-// =====================
-// Upstash Redis REST helper
-// IMPORTANT: body must be ARRAY, endpoint must be /command
-// =====================
-async function redis(cmdArray) {
-  if (!Array.isArray(cmdArray) || cmdArray.length === 0) {
-    throw new Error("redis(): cmdArray must be a non-empty array");
-  }
-
-  // Accept both: https://xxx.upstash.io  OR https://xxx.upstash.io/command
-  const url = UP_URL.endsWith("/command") ? UP_URL : `${UP_URL}/command`;
-
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${UP_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    // MUST be an array like ["GET","key"]
-    body: JSON.stringify(cmdArray),
-  });
-
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok || data.error) throw new Error(data.error || `Upstash HTTP ${resp.status}`);
-  return data.result;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
 }
 
-// =====================
-// Utils
-// =====================
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  auth: { persistSession: false },
+});
+
+// ===== Helpers =====
 function isAdmin(ctx) {
   const id = String(ctx.from?.id || "");
   return ADMIN_IDS.includes(id);
@@ -63,7 +34,7 @@ function isAdmin(ctx) {
 
 function genToken(len = 10) {
   return crypto
-    .randomBytes(16)
+    .randomBytes(24)
     .toString("base64url")
     .replace(/[^a-zA-Z0-9]/g, "")
     .slice(0, len);
@@ -92,47 +63,98 @@ function kbForToken(token) {
   };
 }
 
+// ===== DB: pool =====
+async function popPoolItem() {
+  // Берём самый старый неиспользованный и помечаем used_at (аналог RPOP)
+  const { data: row, error: selErr } = await supabase
+    .from("pool_items")
+    .select("id,value")
+    .is("used_at", null)
+    .order("id", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+
+  if (selErr) throw selErr;
+  if (!row) return null;
+
+  const { error: updErr } = await supabase
+    .from("pool_items")
+    .update({ used_at: new Date().toISOString() })
+    .eq("id", row.id);
+
+  if (updErr) throw updErr;
+  return row.value;
+}
+
+async function pushPoolLines(lines) {
+  if (!lines.length) return 0;
+  const payload = lines.map((value) => ({ value }));
+  const { error } = await supabase.from("pool_items").insert(payload);
+  if (error) throw error;
+  return lines.length;
+}
+
+async function countPool() {
+  const { count, error } = await supabase
+    .from("pool_items")
+    .select("*", { count: "exact", head: true })
+    .is("used_at", null);
+  if (error) throw error;
+  return count || 0;
+}
+
+// ===== DB: tokens =====
+async function saveTokenRecord(rec) {
+  const { error } = await supabase.from("tokens").upsert(rec, { onConflict: "token" });
+  if (error) throw error;
+}
+
 async function getTokenRecord(token) {
-  const raw = await redis(["GET", `token:${token}`]);
-  if (!raw) return null;
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
+  const { data, error } = await supabase.from("tokens").select("*").eq("token", token).maybeSingle();
+  if (error) throw error;
+  return data || null;
 }
 
-async function saveTokenRecord(token, rec) {
-  await redis(["SET", `token:${token}`, JSON.stringify(rec)]);
+async function revokeToken(token, by) {
+  const { error } = await supabase
+    .from("tokens")
+    .update({ revoked: true, revoked_at: new Date().toISOString() })
+    .eq("token", token);
+  if (error) throw error;
+
+  await logToChannel(
+    `[REVOKE]\nby=${by.username || "-"} id=${by.id || "-"}\ntoken=${token}\ntime=${new Date().toISOString()}`
+  );
 }
 
-async function pushIssued(token) {
-  await redis(["LPUSH", "issued", token]);
-  await redis(["LTRIM", "issued", 0, 49]);
+async function lastIssued(n = 10) {
+  const { data, error } = await supabase
+    .from("tokens")
+    .select("token,created_at,revoked")
+    .order("created_at", { ascending: false })
+    .limit(n);
+  if (error) throw error;
+  return data || [];
 }
 
-// =====================
-// Core logic
-// =====================
+// ===== Bot logic =====
 async function issueLinkForUser(ctx) {
-  // Take one item from pool
-  const item = await redis(["RPOP", "pool"]);
+  const item = await popPoolItem();
   if (!item) {
-    await ctx.reply("Сейчас нет доступов. Пожалуйста, подождите — админ пополнит список.");
+    await ctx.reply("Сейчас нет доступов. Пожалуйста, подождите — админ пополнит список и попробуйте снова.");
     await logToChannel(
       `[EMPTY]\nuser=${ctx.from?.username || "-"} id=${ctx.from?.id || "-"}\ntime=${new Date().toISOString()}`
     );
     return;
   }
 
-  // Parse "login:key" (key can include ':')
+  // "login:key" (key может содержать ':')
   const s = String(item);
   const parts = s.split(":");
   let login = "";
   let key = "";
-
   if (parts.length >= 2) {
-    login = parts.shift() || "";
+    login = parts.shift();
     key = parts.join(":");
   } else {
     login = `user_${Date.now()}`;
@@ -140,16 +162,18 @@ async function issueLinkForUser(ctx) {
   }
 
   const token = genToken(10);
-  const record = {
+  const rec = {
+    token,
     login,
     key,
-    issued_to: { id: ctx.from?.id, username: ctx.from?.username },
-    created_at: Date.now(),
+    issued_to_id: String(ctx.from?.id || ""),
+    issued_to_username: String(ctx.from?.username || ""),
+    created_at: new Date().toISOString(),
     revoked: false,
+    revoked_at: null,
   };
 
-  await saveTokenRecord(token, record);
-  await pushIssued(token);
+  await saveTokenRecord(rec);
 
   const link = `${SITE_BASE}/${token}`;
 
@@ -166,27 +190,24 @@ async function handleDelete(ctx, token) {
   const rec = await getTokenRecord(token);
   if (!rec) return ctx.answerCbQuery("Ссылка не найдена.", { show_alert: true });
 
-  rec.revoked = true;
-  rec.revoked_at = Date.now();
-  await saveTokenRecord(token, rec);
+  await supabase
+    .from("tokens")
+    .update({ revoked: true, revoked_at: new Date().toISOString() })
+    .eq("token", token);
 
   await logToChannel(
-    `[DELETE]\nadmin=${ctx.from?.username || "-"} id=${ctx.from?.id || "-"}\ntoken=${token}\ntime=${new Date().toISOString()}`
+    `[DELETE]\nby=${ctx.from?.username || "-"} id=${ctx.from?.id || "-"}\ntoken=${token}\ntime=${new Date().toISOString()}`
   );
 
   return ctx.answerCbQuery("Ссылка удалена (отключена).", { show_alert: true });
 }
 
-// =====================
-// Bot setup
-// =====================
+// ===== Start bot =====
 const bot = new Telegraf(BOT_TOKEN);
 
-// User
-bot.start(async (ctx) => issueLinkForUser(ctx));
-bot.command("link", async (ctx) => issueLinkForUser(ctx));
+bot.start(issueLinkForUser);
+bot.command("link", issueLinkForUser);
 
-// Callback delete
 bot.on("callback_query", async (ctx) => {
   try {
     const data = String(ctx.callbackQuery?.data || "");
@@ -198,37 +219,27 @@ bot.on("callback_query", async (ctx) => {
   }
 });
 
-// =====================
-// Admin commands
-// =====================
+// ===== Admin commands =====
 bot.command("stock", async (ctx) => {
   if (!isAdmin(ctx)) return;
-  const n = await redis(["LLEN", "pool"]);
+  const n = await countPool();
   await ctx.reply(`В пуле доступов: ${n}`);
 });
 
 bot.command("revoke", async (ctx) => {
   if (!isAdmin(ctx)) return;
-
   const token = String(ctx.message?.text || "").split(/\s+/)[1] || "";
   if (!token) return ctx.reply("Использование: /revoke <token>");
 
   const rec = await getTokenRecord(token);
   if (!rec) return ctx.reply("Токен не найден.");
 
-  rec.revoked = true;
-  rec.revoked_at = Date.now();
-  await saveTokenRecord(token, rec);
-
+  await revokeToken(token, { id: ctx.from?.id, username: ctx.from?.username });
   await ctx.reply(`Ок. Ссылка отключена: ${token}`);
-  await logToChannel(
-    `[REVOKE]\nadmin=${ctx.from?.username || "-"} id=${ctx.from?.id || "-"}\ntoken=${token}\ntime=${new Date().toISOString()}`
-  );
 });
 
 bot.command("info", async (ctx) => {
   if (!isAdmin(ctx)) return;
-
   const token = String(ctx.message?.text || "").split(/\s+/)[1] || "";
   if (!token) return ctx.reply("Использование: /info <token>");
 
@@ -236,69 +247,67 @@ bot.command("info", async (ctx) => {
   if (!rec) return ctx.reply("Токен не найден.");
 
   const status = rec.revoked ? "REVOKED" : "ACTIVE";
-
   await ctx.reply(
-    `token: ${token}` +
+    `token: ${rec.token}` +
       `\nstatus: ${status}` +
       `\nlogin: ${rec.login || "-"}` +
-      `\nissued_to: ${rec.issued_to?.username || "-"} (${rec.issued_to?.id || "-"})` +
+      `\nissued_to: ${rec.issued_to_username || "-"} (${rec.issued_to_id || "-"})` +
       `\ncreated: ${new Date(rec.created_at).toISOString()}`
   );
 });
 
 bot.command("list", async (ctx) => {
   if (!isAdmin(ctx)) return;
-
-  const tokens = await redis(["LRANGE", "issued", 0, 9]).catch(() => []);
-  if (!tokens || tokens.length === 0) return ctx.reply("Список пуст.");
-
-  await ctx.reply("Последние токены:\n" + tokens.map((t) => `- ${t}`).join("\n"));
+  const rows = await lastIssued(10);
+  if (!rows.length) return ctx.reply("Список пуст.");
+  await ctx.reply(
+    "Последние токены:\n" +
+      rows
+        .map((r) => `- ${r.token} ${r.revoked ? "(revoked)" : ""}`)
+        .join("\n")
+  );
 });
 
-// /upload: admin sends lines after command OR attaches .txt
+// /upload: строки после команды или .txt
 bot.command("upload", async (ctx) => {
   if (!isAdmin(ctx)) return;
 
   const msg = ctx.message;
 
-  // If message has document (txt)
+  // .txt файл
   if (msg?.document) {
     const fileId = msg.document.file_id;
     const file = await ctx.telegram.getFile(fileId);
     const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
     const text = await (await fetch(fileUrl)).text();
     const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+
     if (!lines.length) return ctx.reply("Файл пустой.");
+    const added = await pushPoolLines(lines);
 
-    for (const line of lines) await redis(["LPUSH", "pool", line]);
-
-    await ctx.reply(`Загружено в пул: ${lines.length}`);
+    await ctx.reply(`Загружено в пул: ${added}`);
     await logToChannel(
-      `[UPLOAD]\nadmin=${ctx.from?.username || "-"}\ncount=${lines.length}\ntime=${new Date().toISOString()}`
+      `[UPLOAD]\nadmin=${ctx.from?.username || "-"}\ncount=${added}\ntime=${new Date().toISOString()}`
     );
     return;
   }
 
-  // Otherwise parse text after /upload
+  // текст после /upload
   const text = String(msg?.text || "");
   const body = text.replace(/^\/upload(@\w+)?\s*/i, "");
   const lines = body.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
 
   if (!lines.length) {
-    return ctx.reply(
-      "Пришли /upload и далее строки вида login:key (каждая с новой строки) или отправь .txt файлом."
-    );
+    return ctx.reply("Пришли /upload и далее строки вида login:key (каждая с новой строки) или отправь .txt файлом.");
   }
 
-  for (const line of lines) await redis(["LPUSH", "pool", line]);
-
-  await ctx.reply(`Загружено в пул: ${lines.length}`);
+  const added = await pushPoolLines(lines);
+  await ctx.reply(`Загружено в пул: ${added}`);
   await logToChannel(
-    `[UPLOAD]\nadmin=${ctx.from?.username || "-"}\ncount=${lines.length}\ntime=${new Date().toISOString()}`
+    `[UPLOAD]\nadmin=${ctx.from?.username || "-"}\ncount=${added}\ntime=${new Date().toISOString()}`
   );
 });
 
-// Error handler (won't crash bot)
 bot.catch(async (err, ctx) => {
   console.error("Bot error", err);
   try {
@@ -306,18 +315,9 @@ bot.catch(async (err, ctx) => {
   } catch (_) {}
 });
 
-// =====================
-// Start (fix 409 conflicts by removing webhook)
-// =====================
-async function start() {
-  // This prevents "409 Conflict" if webhook was set somewhere
-  await bot.telegram.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
-  await bot.launch({ dropPendingUpdates: true });
-
-  console.log("Bot started");
-}
-
-start();
+// важно: если у тебя где-то был webhook — он должен быть удалён, но ты уже удалял.
+await bot.launch();
+console.log("Bot started");
 
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
